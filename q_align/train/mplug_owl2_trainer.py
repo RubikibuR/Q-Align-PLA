@@ -2,6 +2,7 @@ import os
 import torch
 
 from torch.utils.data import Sampler
+from q_align.constants import IGNORE_INDEX
 
 from transformers import Trainer
 from transformers.trainer import (
@@ -163,36 +164,99 @@ class MPLUGOwl2Trainer(Trainer):
         if self.optimizer is None:
             decay_parameters = get_parameter_names(opt_model, ALL_LAYERNORM_LAYERS)
             decay_parameters = [name for name in decay_parameters if "bias" not in name]
-            if self.args.visual_abstractor_lr is not None:
-                projector_parameters = [name for name, _ in opt_model.named_parameters() if "visual_abstractor_lr" in name]
+
+            # 支持PLA模型的protein_abstractor和ligand_abstractor
+            has_protein_abstractor_lr = hasattr(self.args, 'protein_abstractor_lr') and self.args.protein_abstractor_lr is not None
+            has_ligand_abstractor_lr = hasattr(self.args, 'ligand_abstractor_lr') and self.args.ligand_abstractor_lr is not None
+            has_visual_abstractor_lr = hasattr(self.args, 'visual_abstractor_lr') and self.args.visual_abstractor_lr is not None
+
+            if has_protein_abstractor_lr or has_ligand_abstractor_lr or has_visual_abstractor_lr:
+                # 收集需要特殊学习率的参数
+                special_lr_parameters = []
+
+                if has_protein_abstractor_lr:
+                    protein_params = [name for name, _ in opt_model.named_parameters() if "protein_abstractor" in name]
+                    special_lr_parameters.extend(protein_params)
+
+                if has_ligand_abstractor_lr:
+                    ligand_params = [name for name, _ in opt_model.named_parameters() if "ligand_abstractor" in name]
+                    special_lr_parameters.extend(ligand_params)
+
+                if has_visual_abstractor_lr:
+                    visual_params = [name for name, _ in opt_model.named_parameters() if "visual_abstractor" in name]
+                    special_lr_parameters.extend(visual_params)
+
                 optimizer_grouped_parameters = [
                     {
                         "params": [
-                            p for n, p in opt_model.named_parameters() if (n in decay_parameters and n not in projector_parameters and p.requires_grad)
+                            p for n, p in opt_model.named_parameters() if (n in decay_parameters and n not in special_lr_parameters and p.requires_grad)
                         ],
                         "weight_decay": self.args.weight_decay,
                     },
                     {
                         "params": [
-                            p for n, p in opt_model.named_parameters() if (n not in decay_parameters and n not in projector_parameters and p.requires_grad)
+                            p for n, p in opt_model.named_parameters() if (n not in decay_parameters and n not in special_lr_parameters and p.requires_grad)
                         ],
                         "weight_decay": 0.0,
-                    },
-                    {
-                        "params": [
-                            p for n, p in opt_model.named_parameters() if (n in decay_parameters and n in projector_parameters and p.requires_grad)
-                        ],
-                        "weight_decay": self.args.weight_decay,
-                        "lr": self.args.visual_abstractor_lr,
-                    },
-                    {
-                        "params": [
-                            p for n, p in opt_model.named_parameters() if (n not in decay_parameters and n in projector_parameters and p.requires_grad)
-                        ],
-                        "weight_decay": 0.0,
-                        "lr": self.args.visual_abstractor_lr,
                     },
                 ]
+
+                # 为protein_abstractor添加参数组
+                if has_protein_abstractor_lr:
+                    optimizer_grouped_parameters.extend([
+                        {
+                            "params": [
+                                p for n, p in opt_model.named_parameters() if (n in decay_parameters and "protein_abstractor" in n and p.requires_grad)
+                            ],
+                            "weight_decay": self.args.weight_decay,
+                            "lr": self.args.protein_abstractor_lr,
+                        },
+                        {
+                            "params": [
+                                p for n, p in opt_model.named_parameters() if (n not in decay_parameters and "protein_abstractor" in n and p.requires_grad)
+                            ],
+                            "weight_decay": 0.0,
+                            "lr": self.args.protein_abstractor_lr,
+                        },
+                    ])
+
+                # 为ligand_abstractor添加参数组
+                if has_ligand_abstractor_lr:
+                    optimizer_grouped_parameters.extend([
+                        {
+                            "params": [
+                                p for n, p in opt_model.named_parameters() if (n in decay_parameters and "ligand_abstractor" in n and p.requires_grad)
+                            ],
+                            "weight_decay": self.args.weight_decay,
+                            "lr": self.args.ligand_abstractor_lr,
+                        },
+                        {
+                            "params": [
+                                p for n, p in opt_model.named_parameters() if (n not in decay_parameters and "ligand_abstractor" in n and p.requires_grad)
+                            ],
+                            "weight_decay": 0.0,
+                            "lr": self.args.ligand_abstractor_lr,
+                        },
+                    ])
+
+                # 为visual_abstractor添加参数组（兼容原始代码）
+                if has_visual_abstractor_lr:
+                    optimizer_grouped_parameters.extend([
+                        {
+                            "params": [
+                                p for n, p in opt_model.named_parameters() if (n in decay_parameters and "visual_abstractor" in n and p.requires_grad)
+                            ],
+                            "weight_decay": self.args.weight_decay,
+                            "lr": self.args.visual_abstractor_lr,
+                        },
+                        {
+                            "params": [
+                                p for n, p in opt_model.named_parameters() if (n not in decay_parameters and "visual_abstractor" in n and p.requires_grad)
+                            ],
+                            "weight_decay": 0.0,
+                            "lr": self.args.visual_abstractor_lr,
+                        },
+                    ])
             else:
                 optimizer_grouped_parameters = [
                     {
@@ -234,3 +298,106 @@ class MPLUGOwl2Trainer(Trainer):
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         super(MPLUGOwl2Trainer, self)._save(output_dir, state_dict)
+
+
+class PLATrainer(MPLUGOwl2Trainer):
+    """
+    扩展 MPLUGOwl2Trainer，覆写 prediction_step 使验证时直接输出亲和力预测值，
+    而不是完整词表 logits（内存友好），并支持 compute_metrics 计算 RMSE/MAE。
+    """
+
+    def __init__(self, *args, preferential_ids=None, weight_tensor=None, **kwargs):
+        """
+        Args:
+            preferential_ids: List[int] — 5 个亲和力等级词在词表中的 token ID，
+                              顺序为升序 pKd [negligible, weak, moderate, strong, potent]
+            weight_tensor:    torch.FloatTensor of shape [5] — 每个等级对应的 pKd 中值，
+                              顺序与 preferential_ids 一致
+        """
+        super().__init__(*args, **kwargs)
+        self.preferential_ids = preferential_ids or []
+        # 保持在 CPU；prediction_step 内会 .to(device) 使用
+        self.weight_tensor = weight_tensor
+
+    def _get_modality_expansion_offset(self, model) -> int:
+        """
+        计算多模态替换带来的序列净增长量：
+        1 个 <protein> 占位符会被替换为 (protein_queries + 1) 个 token，净增 protein_queries；
+        1 个 <ligand> 占位符会被替换为 (ligand_queries + 1) 个 token，净增 ligand_queries。
+        因此总偏移量 = protein_queries + ligand_queries。
+        """
+        unwrapped_model = model.module if hasattr(model, "module") else model
+
+        try:
+            core_model = unwrapped_model.get_model()
+            protein_queries = int(core_model.protein_abstractor.query_embeds.shape[1])
+            ligand_queries = int(core_model.ligand_abstractor.query_embeds.shape[1])
+            return protein_queries + ligand_queries
+        except Exception:
+            pass
+
+        try:
+            pla_cfg = unwrapped_model.config.pla_config
+            protein_queries = int(pla_cfg["protein_abstractor"]["num_learnable_queries"])
+            ligand_queries = int(pla_cfg["ligand_abstractor"]["num_learnable_queries"])
+            return protein_queries + ligand_queries
+        except Exception:
+            return 0
+
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        """
+        验证时:
+        1. 前向传播获得 loss 和 logits
+        2. 取最后一个 token 位置的 5 个等级 logits → softmax → 加权求和 → 预测 pKd
+        3. 返回 (loss, pred_affinities [batch], true_affinities [batch])
+           而不是完整的 (loss, logits [batch, seq, vocab], labels [batch, seq])
+        """
+        has_labels = "labels" in inputs
+
+        inputs = self._prepare_inputs(inputs)
+
+        # 分布式评估下 gather 走 GPU backend，不能在这里提前转到 CPU。
+        true_affinities = inputs.get("affinities", None)
+        if isinstance(true_affinities, torch.Tensor):
+            true_affinities = true_affinities.detach().float()
+
+        with torch.no_grad():
+            outputs = model(**inputs)
+
+        loss = None
+        if has_labels and outputs.loss is not None:
+            loss = outputs.loss.mean().detach()
+
+        if prediction_loss_only:
+            return (loss, None, None)
+
+        logits = outputs.logits  # [batch, seq_len, vocab_size]
+
+        if logits is not None and len(self.preferential_ids) > 0:
+            # inputs["labels"] 是原始未展开序列，logits 是模型内部插入蛋白/配体特征后的展开序列。
+            # 这里优先定位“第一个等级词 token”在 labels 中的位置，
+            # 再映射到展开序列并取其前一个位置的 logit（下一个 token 预测）。
+            expansion_offset = self._get_modality_expansion_offset(model)
+
+            labels_in = inputs.get("labels", None)
+            if labels_in is not None:
+                pref_ids_tensor = torch.tensor(self.preferential_ids, device=labels_in.device, dtype=labels_in.dtype)
+                pref_token_mask = (labels_in.unsqueeze(-1) == pref_ids_tensor.view(1, 1, -1)).any(dim=-1)  # [batch, seq]
+                has_pref_token = pref_token_mask.any(dim=1)  # [batch]
+
+                first_pref_pos = pref_token_mask.int().argmax(dim=1)  # [batch]
+                first_non_ignore_pos = (labels_in != IGNORE_INDEX).int().argmax(dim=1)  # [batch]
+                target_pos = torch.where(has_pref_token, first_pref_pos, first_non_ignore_pos)  # [batch]
+
+                logit_pos = (target_pos - 1 + expansion_offset).clamp(min=0, max=logits.shape[1] - 1)  # [batch]
+                batch_idx = torch.arange(logits.shape[0], device=logits.device)
+                aff_logits = logits[batch_idx, logit_pos][:, self.preferential_ids].float()  # [batch, 5]
+            else:
+                aff_logits = logits[:, -1, self.preferential_ids].float()  # fallback
+            probs = torch.softmax(aff_logits, dim=-1)                   # [batch, 5]
+            wt = self.weight_tensor.to(probs.device).float()            # [5]
+            pred_affinities = (probs @ wt).detach()                     # [batch]
+        else:
+            pred_affinities = None
+
+        return (loss, pred_affinities, true_affinities)

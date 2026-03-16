@@ -4,7 +4,7 @@ import base64
 
 import torch
 from transformers import StoppingCriteria
-from q_align.constants import IMAGE_TOKEN_INDEX,DEFAULT_IMAGE_TOKEN
+from q_align.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, PROTEIN_TOKEN_INDEX, LIGAND_TOKEN_INDEX, DEFAULT_PROTEIN_TOKEN, DEFAULT_LIGAND_TOKEN
 from icecream import ic
 
 
@@ -79,6 +79,68 @@ def get_model_name_from_path(model_path):
         return model_paths[-2] + "_" + model_paths[-1]
     else:
         return model_paths[-1]
+
+
+def tokenizer_multimodal_token(prompt, tokenizer,
+                                protein_token_index=PROTEIN_TOKEN_INDEX,
+                                ligand_token_index=LIGAND_TOKEN_INDEX,
+                                return_tensors=None):
+    """
+    处理包含蛋白质和配体占位符的prompt
+    将<|protein|>替换为protein_token_index，<|ligand|>替换为ligand_token_index
+    """
+    # 先处理蛋白质token
+    prompt_chunks = []
+    current_chunk = ""
+
+    # 分割prompt，处理<|protein|>和<|ligand|>
+    i = 0
+    tokens_to_insert = []
+
+    while i < len(prompt):
+        if prompt[i:i+len(DEFAULT_PROTEIN_TOKEN)] == DEFAULT_PROTEIN_TOKEN:
+            if current_chunk:
+                prompt_chunks.append(('text', current_chunk))
+                current_chunk = ""
+            prompt_chunks.append(('protein', None))
+            i += len(DEFAULT_PROTEIN_TOKEN)
+        elif prompt[i:i+len(DEFAULT_LIGAND_TOKEN)] == DEFAULT_LIGAND_TOKEN:
+            if current_chunk:
+                prompt_chunks.append(('text', current_chunk))
+                current_chunk = ""
+            prompt_chunks.append(('ligand', None))
+            i += len(DEFAULT_LIGAND_TOKEN)
+        else:
+            current_chunk += prompt[i]
+            i += 1
+
+    if current_chunk:
+        prompt_chunks.append(('text', current_chunk))
+
+    # 构建input_ids
+    input_ids = []
+    for idx, (chunk_type, chunk_content) in enumerate(prompt_chunks):
+        if chunk_type == 'text':
+            chunk_ids = tokenizer(chunk_content).input_ids
+            if idx == 0 and len(chunk_ids) > 0 and chunk_ids[0] == tokenizer.bos_token_id:
+                input_ids.append(chunk_ids[0])
+                input_ids.extend(chunk_ids[1:])
+            else:
+                # 跳过后续chunk的bos_token
+                if len(chunk_ids) > 0 and chunk_ids[0] == tokenizer.bos_token_id:
+                    input_ids.extend(chunk_ids[1:])
+                else:
+                    input_ids.extend(chunk_ids)
+        elif chunk_type == 'protein':
+            input_ids.append(protein_token_index)
+        elif chunk_type == 'ligand':
+            input_ids.append(ligand_token_index)
+
+    if return_tensors is not None:
+        if return_tensors == 'pt':
+            return torch.tensor(input_ids, dtype=torch.long)
+        raise ValueError(f'Unsupported tensor type: {return_tensors}')
+    return input_ids
 
 
 

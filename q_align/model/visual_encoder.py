@@ -485,23 +485,18 @@ class MplugOwlVisualAbstractorMultiHeadAttention(nn.Module):
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
         self.save_attention = False
-        
-#         self.q_pos_embed = nn.Parameter(
-#             torch.from_numpy(get_1d_sincos_pos_embed_from_grid(config.hidden_size, np.arange(config.num_learnable_queries, dtype=np.float32))).float()
-#         ).requires_grad_(False)
-#         grids = config.grid_size
-#         self.k_pos_embed = nn.Parameter(
-#             torch.from_numpy(get_2d_sincos_pos_embed(config.hidden_size, grids, cls_token=True)).float()
-#         ).requires_grad_(False)
-        grids = config.grid_size
+
+        # Query位置编码（固定）
         self.register_buffer(
-            'q_pos_embed', 
-            torch.from_numpy(get_1d_sincos_pos_embed_from_grid(config.hidden_size, np.arange(config.num_learnable_queries, dtype=np.float32))).float()
+            'q_pos_embed',
+            torch.from_numpy(get_1d_sincos_pos_embed_from_grid(
+                config.hidden_size,
+                np.arange(config.num_learnable_queries, dtype=np.float32)
+            )).float()
         )
-        self.register_buffer(
-            'k_pos_embed', 
-            torch.from_numpy(get_2d_sincos_pos_embed(config.hidden_size, grids, cls_token=True)).float()
-        )
+
+        # Key位置编码将在forward中动态生成（支持可变序列长度）
+        self.hidden_size = config.hidden_size
         
 
     def save_attn_gradients(self, attn_gradients):
@@ -521,6 +516,18 @@ class MplugOwlVisualAbstractorMultiHeadAttention(nn.Module):
         x = x.view(*new_x_shape)
         return x.permute(0, 2, 1, 3)
 
+    def _get_1d_pos_embed(self, seq_length):
+        """动态生成1D位置编码
+        Args:
+            seq_length: 序列长度
+        Returns:
+            pos_embed: (seq_length, hidden_size)
+        """
+        positions = np.arange(seq_length, dtype=np.float32)
+        return torch.from_numpy(
+            get_1d_sincos_pos_embed_from_grid(self.hidden_size, positions)
+        ).float()
+
     def forward(
         self,
         hidden_states,
@@ -531,19 +538,27 @@ class MplugOwlVisualAbstractorMultiHeadAttention(nn.Module):
         past_key_value=None,
         output_attentions=False,
     ):
-        # If this is instantiated as a cross-attention module, the keys
-        # and values come from an encoder; the attention mask needs to be
-        # such that the encoder's padding tokens are not attended to.
-        
-        qk_pos_embed = torch.cat([self.q_pos_embed, self.k_pos_embed], dim = 0).unsqueeze(0).to(dtype=hidden_states.dtype)
-        
-        key_layer = self.transpose_for_scores(self.key(encoder_hidden_states + qk_pos_embed))
+        # 动态生成Key位置编码（支持可变序列长度）
+        batch_size, seq_length, _ = encoder_hidden_states.shape
+        k_pos_embed = self._get_1d_pos_embed(seq_length).to(
+            encoder_hidden_states.device,
+            dtype=hidden_states.dtype
+        )
+
+        # 分别处理query和key
+        query_layer = self.transpose_for_scores(self.query(hidden_states))
+        key_layer = self.transpose_for_scores(self.key(encoder_hidden_states))
         value_layer = self.transpose_for_scores(self.value(encoder_hidden_states))
+
+        # 添加位置编码到query和key
+        # query_layer: (batch, num_heads, num_queries, head_size)
+        # key_layer: (batch, num_heads, seq_length, head_size)
+        query_layer = query_layer + self.transpose_for_scores(
+            self.q_pos_embed.unsqueeze(0).to(device=query_layer.device, dtype=query_layer.dtype)
+        )
+        key_layer = key_layer + self.transpose_for_scores(k_pos_embed.unsqueeze(0))
+
         attention_mask = encoder_attention_mask
-
-        mixed_query_layer = self.query(hidden_states + self.q_pos_embed.unsqueeze(0).to(dtype=hidden_states.dtype))
-
-        query_layer = self.transpose_for_scores(mixed_query_layer)
 
         past_key_value = (key_layer, value_layer)
 
@@ -604,7 +619,7 @@ class MplugOwlVisualAbstractorAttention(nn.Module):
         self.output = MplugOwlVisualAbstractorCrossOutput(config)
         self.pruned_heads = set()
         self.norm1 = nn.LayerNorm(config.hidden_size)
-        self.normk = nn.LayerNorm(config.hidden_size)
+        self.normk = nn.LayerNorm(config.encoder_hidden_size)
 
     def prune_heads(self, heads):
         if len(heads) == 0:
@@ -918,5 +933,136 @@ class MplugOwlVisualAbstractorModel(PreTrainedModel):
             pooler_output=pooled_output,
             hidden_states=encoder_outputs.hidden_states,
         )
-    
+
+
+# ============================================================================
+# PLA: Protein and Ligand Abstractor Models
+# ============================================================================
+
+class BaseAbstractorModel(PreTrainedModel):
+    """
+    抽象器模型基类，使用cross-attention从编码器输出中提取关键特征
+    ProteinAbstractorModel和LigandAbstractorModel共享此实现
+    """
+    _no_split_modules = ["MplugOwlVisualAbstractorLayer"]
+
+    def __init__(self, config, language_hidden_size):
+        super().__init__(config)
+        self.config = config
+
+        self.encoder = MplugOwlVisualAbstractorEncoder(config)
+        self.visual_fc = torch.nn.Linear(config.hidden_size, language_hidden_size)
+        self.query_embeds = torch.nn.Parameter(torch.randn(1, config.num_learnable_queries, config.hidden_size))
+        self.vit_eos = torch.nn.Parameter(torch.randn(1, 1, language_hidden_size))
+
+        self.post_init()
+
+    def _prune_heads(self, heads_to_prune):
+        for layer, heads in heads_to_prune.items():
+            self.encoder.layer[layer].attention.prune_heads(heads)
+
+    def get_extended_attention_mask(
+        self,
+        attention_mask: torch.Tensor,
+        input_shape: Tuple[int],
+        device: torch.device,
+    ) -> torch.Tensor:
+        if attention_mask.dim() == 3:
+            extended_attention_mask = attention_mask[:, None, :, :]
+        elif attention_mask.dim() == 2:
+            extended_attention_mask = attention_mask[:, None, None, :]
+        else:
+            raise ValueError(
+                "Wrong shape for input_ids (shape {}) or attention_mask (shape {})".format(
+                    input_shape, attention_mask.shape
+                )
+            )
+
+        extended_attention_mask = extended_attention_mask.to(dtype=self.dtype)
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+        return extended_attention_mask
+
+    def forward(
+        self,
+        query_embeds=None,
+        attention_mask=None,
+        head_mask=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        past_key_values=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+    ):
+        if query_embeds is None:
+            query_embeds = self.query_embeds.repeat(encoder_hidden_states.shape[0], 1, 1)
+
+        attention_mask = torch.ones(query_embeds.shape[:-1], dtype=torch.long, device=query_embeds.device)
+        embedding_output = query_embeds
+
+        input_shape = embedding_output.size()[:-1]
+        batch_size, seq_length = input_shape
+        device = embedding_output.device
+
+        if attention_mask is None:
+            attention_mask = torch.ones(((batch_size, seq_length)), device=device)
+
+        extended_attention_mask = self.get_extended_attention_mask(attention_mask, input_shape, device)
+
+        if encoder_hidden_states is not None:
+            if isinstance(encoder_hidden_states, list):
+                encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states[0].size()
+            else:
+                encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
+            encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
+
+            if isinstance(encoder_attention_mask, list):
+                encoder_extended_attention_mask = [self.invert_attention_mask(mask) for mask in encoder_attention_mask]
+            elif encoder_attention_mask is None:
+                encoder_attention_mask = torch.ones(encoder_hidden_shape, device=device)
+                encoder_extended_attention_mask = self.invert_attention_mask(encoder_attention_mask)
+            else:
+                encoder_extended_attention_mask = self.invert_attention_mask(encoder_attention_mask)
+        else:
+            encoder_extended_attention_mask = None
+
+        head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
+
+        encoder_outputs = self.encoder(
+            embedding_output,
+            attention_mask=extended_attention_mask,
+            head_mask=head_mask,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_extended_attention_mask,
+            past_key_values=past_key_values,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        sequence_output = encoder_outputs[0]
+        pooled_output = sequence_output[:, 0, :]
+
+        sequence_output = self.visual_fc(sequence_output)
+        sequence_output = torch.cat([sequence_output, self.vit_eos.repeat(sequence_output.shape[0], 1, 1)], dim=1)
+
+        return BaseModelOutputWithPooling(
+            last_hidden_state=sequence_output,
+            pooler_output=pooled_output,
+            hidden_states=encoder_outputs.hidden_states,
+        )
+
+
+class ProteinAbstractorModel(BaseAbstractorModel):
+    """
+    蛋白质抽象器模型，使用cross-attention从蛋白质编码器输出中提取关键特征
+    """
+    pass
+
+
+class LigandAbstractorModel(BaseAbstractorModel):
+    """
+    配体抽象器模型，使用cross-attention从配体编码器输出中提取关键特征
+    """
+    pass
+
     

@@ -34,12 +34,12 @@ def _get_unpad_data(attention_mask):
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
-from .modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
+from .modeling_attn_mask_utils import _prepare_4d_causal_attention_mask, _prepare_4d_causal_attention_mask as _prepare_4d_causal_attention_mask_for_sdpa
 from .configuration_mplug_owl2 import LlamaConfig
 
 class MultiwayNetwork(nn.Module):
 
-    def __init__(self, module_provider, num_multiway=2):
+    def __init__(self, module_provider, num_multiway=3):
         super(MultiwayNetwork, self).__init__()
 
         self.multiway = torch.nn.ModuleList([module_provider() for _ in range(num_multiway)])
