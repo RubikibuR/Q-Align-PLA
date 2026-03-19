@@ -46,13 +46,42 @@ def get_preferential_ids(tokenizer) -> List[int]:
     return [ids[1] for ids in tokenizer(PLA_LEVEL_NAMES)["input_ids"]]
 
 
-def compute_affinity_metrics(predictions, labels) -> dict:
-    """计算 RMSE / MAE / Pearson R 等指标，返回指标字典。"""
-    preds = np.array(predictions, dtype=np.float64).flatten()
+def preds_to_classes(values, thresholds):
+    """将连续亲和力值按 thresholds 映射为类别索引（0 ~ num_levels-1）。"""
+    # thresholds 有 num_levels+1 个边界，区间 [thresholds[i], thresholds[i+1])
+    classes = np.zeros(len(values), dtype=np.int64)
+    for i in range(len(thresholds) - 1):
+        if i == len(thresholds) - 2:
+            # 最后一个区间包含右边界
+            mask = values >= thresholds[i]
+        else:
+            mask = (values >= thresholds[i]) & (values < thresholds[i + 1])
+        classes[mask] = i
+    return classes
+
+
+def compute_affinity_metrics(predictions, labels, thresholds=None) -> dict:
+    """计算 RMSE / MAE / Pearson R 等指标，返回指标字典。
+
+    predictions: shape [N, 2] — 第0列=pred_pkd, 第1列=pred_class (argmax)
+                 或 shape [N] — 仅 pred_pkd（向后兼容）
+    labels:      shape [N] — 真实 pKd 值
+    """
+    predictions = np.array(predictions, dtype=np.float64)
     lbls = np.array(labels, dtype=np.float64).flatten()
+
+    # 解包 predictions
+    if predictions.ndim == 2 and predictions.shape[1] >= 2:
+        preds = predictions[:, 0].flatten()
+        pred_classes = predictions[:, 1].flatten().astype(np.int64)
+    else:
+        preds = predictions.flatten()
+        pred_classes = None
 
     valid = np.isfinite(preds) & np.isfinite(lbls)
     preds, lbls = preds[valid], lbls[valid]
+    if pred_classes is not None:
+        pred_classes = pred_classes[valid]
 
     if len(preds) == 0:
         return {
@@ -63,6 +92,7 @@ def compute_affinity_metrics(predictions, labels) -> dict:
             "pearson_p": 1.0,
             "spearman_r": 0.0,
             "spearman_p": 1.0,
+            "accuracy": 0.0,
             "num_samples": 0,
         }
 
@@ -77,6 +107,17 @@ def compute_affinity_metrics(predictions, labels) -> dict:
         pearson_r, pearson_p = 0.0, 1.0
         spearman_r, spearman_p = 0.0, 1.0
 
+    accuracy = 0.0
+    if thresholds is not None:
+        true_classes = preds_to_classes(lbls, thresholds)
+        if pred_classes is not None:
+            # 直接使用 argmax 类别计算 accuracy
+            accuracy = float(np.mean(pred_classes == true_classes))
+        else:
+            # 向后兼容：从连续预测值回映射
+            pred_classes_from_pkd = preds_to_classes(preds, thresholds)
+            accuracy = float(np.mean(pred_classes_from_pkd == true_classes))
+
     return {
         "rmse": rmse,
         "mae": mae,
@@ -85,20 +126,22 @@ def compute_affinity_metrics(predictions, labels) -> dict:
         "pearson_p": float(pearson_p),
         "spearman_r": float(spearman_r),
         "spearman_p": float(spearman_p),
+        "accuracy": accuracy,
         "num_samples": int(len(preds)),
     }
 
 
-def compute_pla_metrics(eval_preds):
-    """
-    compute_metrics 回调：从 PLATrainer.prediction_step 的输出计算 RMSE / MAE / SD / Pearson R。
-    """
-    metrics = compute_affinity_metrics(eval_preds.predictions, eval_preds.label_ids)
-    rank0_print(
-        f"  [Val] RMSE={metrics['rmse']:.4f}  MAE={metrics['mae']:.4f}  "
-        f"SD={metrics['sd']:.4f}  Pearson R={metrics['pearson_r']:.4f}"
-    )
-    return {k: metrics[k] for k in ("rmse", "mae", "sd", "pearson_r")}
+def make_compute_pla_metrics(thresholds):
+    """返回绑定了 thresholds 的 compute_metrics 回调。"""
+    def compute_pla_metrics(eval_preds):
+        metrics = compute_affinity_metrics(eval_preds.predictions, eval_preds.label_ids, thresholds=thresholds)
+        rank0_print(
+            f"  [Val] RMSE={metrics['rmse']:.4f}  MAE={metrics['mae']:.4f}  "
+            f"SD={metrics['sd']:.4f}  Pearson R={metrics['pearson_r']:.4f}  "
+            f"Accuracy={metrics['accuracy']:.4f}"
+        )
+        return {k: metrics[k] for k in ("rmse", "mae", "sd", "pearson_r", "accuracy")}
+    return compute_pla_metrics
 
 
 def rank0_print(*args):
@@ -109,7 +152,7 @@ def rank0_print(*args):
 @dataclass
 class ModelArguments:
     model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
-    version: Optional[str] = field(default="v0")
+    version: Optional[str] = field(default="vicuna_v1")
     freeze_backbone: bool = field(default=False)
 
 @dataclass
@@ -132,6 +175,8 @@ class TrainingArguments(transformers.TrainingArguments):
     optim: str = field(default="adamw_torch")
     remove_unused_columns: bool = field(default=False)
     load_best_model_at_end: bool = field(default=True)
+    metric_for_best_model: str = field(default="accuracy")
+    greater_is_better: bool = field(default=True)
 
     # PLA specific arguments
     tune_protein_abstractor: bool = field(default=True)
@@ -645,15 +690,18 @@ def train():
     weight_tensor = torch.tensor(train_weights, dtype=torch.float32)
     rank0_print(f"Weight tensor (interval medians): {weight_tensor.tolist()}")
 
+    train_thresholds = data_module["train_dataset"].thresholds
+
     trainer = PLATrainer(
         model=model,
         tokenizer=tokenizer,
         args=training_args,
-        compute_metrics=compute_pla_metrics,
+        compute_metrics=make_compute_pla_metrics(train_thresholds),
         preferential_ids=preferential_ids,
         weight_tensor=weight_tensor,
         **data_module,
     )
+    trainer.set_train_thresholds(train_thresholds)
 
     # if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
     #     trainer.train(resume_from_checkpoint=True)
@@ -683,7 +731,7 @@ def train():
 
         test_output = trainer.predict(test_dataset)
         test_metrics = compute_affinity_metrics(
-            test_output.predictions, test_output.label_ids
+            test_output.predictions, test_output.label_ids, thresholds=train_thresholds
         )
 
         # Persist test metrics to output_dir for later comparison and reporting.
@@ -697,6 +745,7 @@ def train():
         rank0_print(f"  SD       : {test_metrics['sd']:.4f}")
         rank0_print(f"  Pearson R: {test_metrics['pearson_r']:.4f}  (p={test_metrics['pearson_p']:.2e})")
         rank0_print(f"  Spearman : {test_metrics['spearman_r']:.4f}  (p={test_metrics['spearman_p']:.2e})")
+        rank0_print(f"  Accuracy : {test_metrics['accuracy']:.4f}")
         rank0_print("=" * 60 + "\n")
 
     model.config.use_cache = True
