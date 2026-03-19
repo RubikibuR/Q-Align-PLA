@@ -199,7 +199,7 @@ class PLADataset(Dataset):
             },
             {
                 "from": "gpt",
-                "value": f"The binding affinity rating is {affinity_level}."
+                "value": f"{affinity_level}"
             }
         ]
 
