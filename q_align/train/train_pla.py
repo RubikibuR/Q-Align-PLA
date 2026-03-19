@@ -455,22 +455,56 @@ def train():
     rank0_print("Initializing PLA model...")
     model = PLALlamaForCausalLM(pla_config)
 
-    # 4. 加载Llama2的预训练权重（只加载LLM部分，忽略缺失的键）
-    rank0_print("Loading Llama2 pretrained weights...")
-    llama_model = AutoModelForCausalLM.from_pretrained(
-        model_args.model_name_or_path,
-        cache_dir=training_args.cache_dir,
-        attn_implementation="flash_attention_2",
-        torch_dtype=compute_dtype,
-        **bnb_model_from_pretrained_args
-    )
-
-    # 5. 复制LLM权重到PLA模型
+    # 4. 直接从 safetensors 加载 LLaMA-2 预训练权重并复制到PLA模型
     rank0_print("Copying LLM weights to PLA model...")
-    model.model.load_state_dict(llama_model.model.state_dict(), strict=False)
-    model.lm_head.load_state_dict(llama_model.lm_head.state_dict())
+    # replace_llama_modality_adaptive() 在 import 时替换了全局 LlamaDecoderLayer，
+    # 导致 AutoModelForCausalLM.from_pretrained 构建的模型使用 MultiwayNetwork 结构，
+    # from_pretrained 无法正确填充三路权重（三路均为随机初始化）。
+    # 直接从 safetensors 文件读取原始 LLaMA-2 预训练权重，绕过模型构建。
+    from safetensors import safe_open
+    import json, re, os
+    index_path = os.path.join(model_args.model_name_or_path, "model.safetensors.index.json")
+    with open(index_path) as f:
+        index = json.load(f)
+    shard_files = sorted(set(index["weight_map"].values()))
+    raw_sd = {}
+    for shard in shard_files:
+        shard_path = os.path.join(model_args.model_name_or_path, shard)
+        with safe_open(shard_path, framework="pt") as f:
+            for k in f.keys():
+                raw_sd[k] = f.get_tensor(k).to(compute_dtype)
 
-    del llama_model  # 释放内存
+    # key 格式: "model.layers.X.self_attn.k_proj.weight" -> 去掉 "model." 前缀
+    # MultiwayNetwork 层需要展开到三路: "xxx.weight" -> "xxx.multiway.{0,1,2}.weight"
+    multiway_suffixes = ["self_attn.k_proj", "self_attn.v_proj",
+                         "input_layernorm", "post_attention_layernorm"]
+    mapped_sd = {}
+    lm_head_sd = {}
+    for key, value in raw_sd.items():
+        if key.startswith("model."):
+            new_key = key[len("model."):]
+        elif key.startswith("lm_head."):
+            lm_head_sd[key[len("lm_head."):]] = value
+            continue
+        else:
+            new_key = key
+        expanded = False
+        for mk in multiway_suffixes:
+            if re.search(rf'\.{re.escape(mk)}\b', new_key):
+                for i in range(3):
+                    mapped_sd[re.sub(rf'\.{re.escape(mk)}\b', f'.{mk}.multiway.{i}', new_key)] = value.clone()
+                expanded = True
+                break
+        if not expanded:
+            mapped_sd[new_key] = value
+
+    missing, unexpected = model.model.load_state_dict(mapped_sd, strict=False)
+    rank0_print(f"Weight loading: {len(missing)} missing, {len(unexpected)} unexpected keys")
+    if missing:
+        rank0_print(f"Missing keys (first 10): {missing[:10]}")
+    if lm_head_sd:
+        model.lm_head.load_state_dict(lm_head_sd, strict=False)
+
     import gc
     gc.collect()
 
