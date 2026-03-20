@@ -232,22 +232,16 @@ def infer_single(
     protein_sequences = inputs["protein_sequences"]
     smiles_list = inputs["smiles_list"]
 
-    # ---- 第一次 forward ----
-    outputs = model(
-        input_ids=input_ids,
-        attention_mask=torch.ones(input_ids.shape, dtype=torch.long, device=device),
-        protein_sequences=protein_sequences,
-        smiles_list=smiles_list,
-    )
-    logits = outputs.logits  # [1, expanded_seq, vocab]
-
-    next_token_id = logits[:, -1, :].argmax(dim=-1, keepdim=True)  # [1, 1]
-    generated_ids = [next_token_id.item()]
+    generated_ids = []
     eos_token_id = tokenizer.eos_token_id
-    cur_ids = torch.cat([input_ids, next_token_id], dim=1)  # [1, seq+1]
+    cur_ids = input_ids
 
-    # ---- 自回归生成文本回答（无 KV cache，每步完整 forward）----
-    for _ in range(max_new_tokens - 1):
+    pred_pkd = float("nan")
+    level_name = "UNKNOWN"
+    probs = torch.full((len(preferential_ids),), float("nan"), dtype=torch.float32)
+
+    # 自回归生成文本回答（无 KV cache，每步完整 forward）
+    for _ in range(max_new_tokens):
         attn_mask = torch.ones(cur_ids.shape, dtype=torch.long, device=device)
         out = model(
             input_ids=cur_ids,
@@ -257,17 +251,19 @@ def infer_single(
         )
         next_token_id = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
         token_id = next_token_id.item()
+
+        generated_ids.append(token_id)
         if token_id == eos_token_id:
             break
+
         if token_id in preferential_ids:
-            aff_logits = out.logits[0, -1, preferential_ids].float()  
-            probs = torch.softmax(aff_logits, dim=-1)                
+            aff_logits = out.logits[0, -1, preferential_ids].float()
+            probs = torch.softmax(aff_logits, dim=-1)
             wt = weight_tensor.to(probs.device).float()
             pred_pkd = float((probs @ wt).item())
             level_idx = int(probs.argmax().item())
             level_name = PLA_LEVEL_NAMES[level_idx]
 
-        generated_ids.append(token_id)
         cur_ids = torch.cat([cur_ids, next_token_id], dim=1)
 
     answer = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
@@ -286,7 +282,7 @@ def infer_single(
 
 def parse_args():
     parser = argparse.ArgumentParser(description="PLA Inference")
-    parser.add_argument("--model_path", default="pla-align-debug/baseline-pdbbind",
+    parser.add_argument("--model_path", default="pla-align-debug/pdbbind-token-baseline",
                         help="训练输出目录（含 LoRA adapter 和 non_lora_trainables.bin）")
     parser.add_argument("--base_model_path", default="/data/chenruixi/resources/modelscope/llama2-7b",
                         help="LLaMA-2 基础模型路径")
@@ -357,8 +353,8 @@ def main():
 
     print()
     df["pred_pkd"] = [r["pred_pkd"] for r in results]
-    df["pred_level"] = [r["level"] for r in results]
     df["answer"] = [r["answer"] for r in results]
+    df["pred_level"] = [r["level"] for r in results]    
 
     if "Y" in df.columns:
         from scipy.stats import pearsonr
