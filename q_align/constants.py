@@ -15,4 +15,4 @@ DEFAULT_PROTEIN_TOKEN = "<|protein|>"
 DEFAULT_LIGAND_TOKEN = "<|ligand|>"
 
 # 亲和力等级名称，按 pKd 升序排列（低 → 高亲和力），全部为单 token 词
-PLA_LEVEL_NAMES = ["negligible", "weak", "moderate", "strong", "potent"]
+PLA_LEVEL_NAMES = ["minimal", "weak", "medium", "strong", "extreme"]
