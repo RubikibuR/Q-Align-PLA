@@ -14,3 +14,5 @@ __pycache__/
 *.bak
 *.tmp
 pla-align*/
+regressor_output/
+wandb/

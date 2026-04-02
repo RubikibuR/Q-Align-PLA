@@ -1,6 +1,6 @@
 import os
 import torch
-import numpy as np
+import torch.nn as nn
 
 from torch.utils.data import Sampler
 from q_align.constants import IGNORE_INDEX
@@ -307,6 +307,10 @@ class PLATrainer(MPLUGOwl2Trainer):
     而不是完整词表 logits（内存友好），并支持 compute_metrics 计算 RMSE/MAE。
     """
 
+    _TRAIN_LOG_KEYS = ("loss", "learning_rate", "grad_norm")
+    _EVAL_LOG_KEYS = ("eval_loss", "eval_rmse", "eval_mae", "eval_sd", "eval_pearson", "eval_spearman")
+    _TEST_LOG_KEYS = ("test_loss", "test_rmse", "test_mae", "test_sd", "test_pearson", "test_spearman")
+
     def __init__(self, *args, preferential_ids=None, weight_tensor=None, **kwargs):
         """
         Args:
@@ -319,11 +323,6 @@ class PLATrainer(MPLUGOwl2Trainer):
         self.preferential_ids = preferential_ids or []
         # 保持在 CPU；prediction_step 内会 .to(device) 使用
         self.weight_tensor = weight_tensor
-        # 训练时累积预测值和真实值，用于 log 时计算 Pearson/Accuracy
-        self._train_preds: List[float] = []
-        self._train_labels: List[float] = []
-        self._train_pred_classes: List[int] = []
-        self._train_thresholds = None  # 由外部通过 set_train_thresholds 设置
 
     def _get_modality_expansion_offset(self, model) -> int:
         """
@@ -422,94 +421,38 @@ class PLATrainer(MPLUGOwl2Trainer):
 
         return (loss, predictions, true_affinities)
 
-    def set_train_thresholds(self, thresholds):
-        """由 train_pla.py 在创建 trainer 后调用，传入训练集阈值。"""
-        self._train_thresholds = thresholds
+    def _filter_logs(self, logs):
+        # 训练阶段只保留 loss，避免冗余日志。
+        if "loss" in logs and not any(k.startswith("eval_") or k.startswith("test_") for k in logs):
+            return {k: logs[k] for k in self._TRAIN_LOG_KEYS if k in logs}
 
-    def _extract_train_pred(self, model, inputs):
-        """从当前 batch 的 logits 提取预测亲和力和真实亲和力，不计算梯度。"""
-        if not self.preferential_ids or self.weight_tensor is None:
-            return None, None, None
-        true_affinities = inputs.get("affinities", None)
-        if true_affinities is None:
-            return None, None, None
-        logits = model(**{k: v for k, v in inputs.items()}).logits
-        expansion_offset = self._get_modality_expansion_offset(model)
-        labels_in = inputs.get("labels", None)
-        if labels_in is not None:
-            pref_ids_tensor = torch.tensor(self.preferential_ids, device=labels_in.device, dtype=labels_in.dtype)
-            pref_token_mask = (labels_in.unsqueeze(-1) == pref_ids_tensor.view(1, 1, -1)).any(dim=-1)
-            has_pref_token = pref_token_mask.any(dim=1)
-            first_pref_pos = pref_token_mask.int().argmax(dim=1)
-            from q_align.constants import IGNORE_INDEX as _IGNORE
-            first_non_ignore_pos = (labels_in != _IGNORE).int().argmax(dim=1)
-            target_pos = torch.where(has_pref_token, first_pref_pos, first_non_ignore_pos)
-            logit_pos = (target_pos - 1 + expansion_offset).clamp(min=0, max=logits.shape[1] - 1)
-            batch_idx = torch.arange(logits.shape[0], device=logits.device)
-            aff_logits = logits[batch_idx, logit_pos][:, self.preferential_ids].float()
-        else:
-            aff_logits = logits[:, -1, self.preferential_ids].float()
-        probs = torch.softmax(aff_logits, dim=-1)
-        wt = self.weight_tensor.to(probs.device).float()
-        preds = (probs @ wt).detach().cpu().numpy()
-        pred_classes = probs.argmax(dim=-1).detach().cpu().numpy()
-        labels = true_affinities.detach().float().cpu().numpy()
-        return preds, pred_classes, labels
+        # 验证阶段仅保留用户关心的指标。
+        if any(k.startswith("eval_") for k in logs):
+            return {k: logs[k] for k in self._EVAL_LOG_KEYS if k in logs}
 
-    def training_step(self, model, inputs, num_items_in_batch=None):
-        # 正常训练步
-        if num_items_in_batch is not None:
-            loss = super().training_step(model, inputs, num_items_in_batch)
-        else:
-            loss = super().training_step(model, inputs)
+        # 测试阶段与验证阶段保持一致的指标集合。
+        if any(k.startswith("test_") for k in logs):
+            return {k: logs[k] for k in self._TEST_LOG_KEYS if k in logs}
 
-        # 每 50 步才做一次额外 forward 来计算训练指标，避免每步双重 forward 的开销
-        if self.state.global_step % 50 == 0:
+        return logs
+
+    def log(self, logs):
+        # Some custom log flows may omit learning_rate; add a robust fallback
+        # so external reporters like W&B can always plot LR.
+        if "loss" in logs and "learning_rate" not in logs:
+            lr = None
             try:
-                with torch.no_grad():
-                    preds, pred_classes, labels = self._extract_train_pred(model, self._prepare_inputs(inputs))
-                if preds is not None:
-                    self._train_preds.extend(preds.tolist())
-                    self._train_labels.extend(labels.tolist())
-                    self._train_pred_classes.extend(pred_classes.tolist())
+                lr = float(self._get_learning_rate())
             except Exception:
                 pass
+            if lr is None and self.optimizer is not None:
+                try:
+                    lr = float(self.optimizer.param_groups[0].get("lr"))
+                except Exception:
+                    pass
+            if lr is not None:
+                logs["learning_rate"] = lr
 
-        return loss
-
-    def log(self, logs, start_time=None):
-        if "loss" in logs and len(self._train_preds) > 1:
-            preds = np.array(self._train_preds, dtype=np.float64)
-            lbls = np.array(self._train_labels, dtype=np.float64)
-            valid = np.isfinite(preds) & np.isfinite(lbls)
-            preds, lbls = preds[valid], lbls[valid]
-            if len(preds) > 1:
-                from scipy.stats import pearsonr
-                pearson_r, _ = pearsonr(lbls, preds)
-                logs["train_pearson_r"] = round(float(pearson_r), 4)
-                if self._train_thresholds is not None and len(self._train_pred_classes) > 0:
-                    pred_cls = np.array(self._train_pred_classes, dtype=np.int64)
-                    pred_cls = pred_cls[valid] if len(pred_cls) == len(valid) else pred_cls[:len(lbls)]
-                    # 真实类别从连续值映射
-                    thresholds = self._train_thresholds
-                    def _to_cls(vals):
-                        cls = np.zeros(len(vals), dtype=np.int64)
-                        for i in range(len(thresholds) - 1):
-                            if i == len(thresholds) - 2:
-                                mask = vals >= thresholds[i]
-                            else:
-                                mask = (vals >= thresholds[i]) & (vals < thresholds[i + 1])
-                            cls[mask] = i
-                        return cls
-                    true_cls = _to_cls(lbls)
-                    acc = float(np.mean(pred_cls[:len(true_cls)] == true_cls))
-                    logs["train_accuracy"] = round(acc, 4)
-            # 清空累积缓冲
-            self._train_preds.clear()
-            self._train_labels.clear()
-            self._train_pred_classes.clear()
-
-        if start_time is not None:
-            super().log(logs, start_time)
-        else:
-            super().log(logs)
+        filtered_logs = self._filter_logs(dict(logs))
+        if filtered_logs:
+            super().log(filtered_logs)
