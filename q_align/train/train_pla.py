@@ -15,6 +15,7 @@
 
 import os
 import copy
+import sys
 from dataclasses import dataclass, field
 import json
 import logging
@@ -39,28 +40,14 @@ from icecream import ic
 import numpy as np
 
 local_rank = None
-
+os.environ["WANDB_PROJECT"] = "q-align"
 
 def get_preferential_ids(tokenizer) -> List[int]:
     """返回 PLA_LEVEL_NAMES 中每个词在词表中的 token ID（取 BOS 之后的第一个 token）。"""
     return [ids[1] for ids in tokenizer(PLA_LEVEL_NAMES)["input_ids"]]
 
 
-def preds_to_classes(values, thresholds):
-    """将连续亲和力值按 thresholds 映射为类别索引（0 ~ num_levels-1）。"""
-    # thresholds 有 num_levels+1 个边界，区间 [thresholds[i], thresholds[i+1])
-    classes = np.zeros(len(values), dtype=np.int64)
-    for i in range(len(thresholds) - 1):
-        if i == len(thresholds) - 2:
-            # 最后一个区间包含右边界
-            mask = values >= thresholds[i]
-        else:
-            mask = (values >= thresholds[i]) & (values < thresholds[i + 1])
-        classes[mask] = i
-    return classes
-
-
-def compute_affinity_metrics(predictions, labels, thresholds=None) -> dict:
+def compute_affinity_metrics(predictions, labels) -> dict:
     """计算 RMSE / MAE / Pearson R 等指标，返回指标字典。
 
     predictions: shape [N, 2] — 第0列=pred_pkd, 第1列=pred_class (argmax)
@@ -73,26 +60,19 @@ def compute_affinity_metrics(predictions, labels, thresholds=None) -> dict:
     # 解包 predictions
     if predictions.ndim == 2 and predictions.shape[1] >= 2:
         preds = predictions[:, 0].flatten()
-        pred_classes = predictions[:, 1].flatten().astype(np.int64)
     else:
         preds = predictions.flatten()
-        pred_classes = None
 
     valid = np.isfinite(preds) & np.isfinite(lbls)
     preds, lbls = preds[valid], lbls[valid]
-    if pred_classes is not None:
-        pred_classes = pred_classes[valid]
 
     if len(preds) == 0:
         return {
             "rmse": float("inf"),
             "mae": float("inf"),
             "sd": float("inf"),
-            "pearson_r": 0.0,
-            "pearson_p": 1.0,
-            "spearman_r": 0.0,
-            "spearman_p": 1.0,
-            "accuracy": 0.0,
+            "pearson": 0.0,
+            "spearman": 0.0,
             "num_samples": 0,
         }
 
@@ -101,46 +81,27 @@ def compute_affinity_metrics(predictions, labels, thresholds=None) -> dict:
     sd = float(np.std(preds - lbls, ddof=1)) if len(preds) > 1 else 0.0
 
     if len(preds) > 1:
-        pearson_r, pearson_p = pearsonr(lbls, preds)
-        spearman_r, spearman_p = spearmanr(lbls, preds)
+        pearson, _ = pearsonr(lbls, preds)
+        spearman, _ = spearmanr(lbls, preds)
     else:
-        pearson_r, pearson_p = 0.0, 1.0
-        spearman_r, spearman_p = 0.0, 1.0
-
-    accuracy = 0.0
-    if thresholds is not None:
-        true_classes = preds_to_classes(lbls, thresholds)
-        if pred_classes is not None:
-            # 直接使用 argmax 类别计算 accuracy
-            accuracy = float(np.mean(pred_classes == true_classes))
-        else:
-            # 向后兼容：从连续预测值回映射
-            pred_classes_from_pkd = preds_to_classes(preds, thresholds)
-            accuracy = float(np.mean(pred_classes_from_pkd == true_classes))
+        pearson = 0.0
+        spearman = 0.0
 
     return {
         "rmse": rmse,
         "mae": mae,
         "sd": sd,
-        "pearson_r": float(pearson_r),
-        "pearson_p": float(pearson_p),
-        "spearman_r": float(spearman_r),
-        "spearman_p": float(spearman_p),
-        "accuracy": accuracy,
+        "pearson": float(pearson),
+        "spearman": float(spearman),
         "num_samples": int(len(preds)),
     }
 
 
-def make_compute_pla_metrics(thresholds):
-    """返回绑定了 thresholds 的 compute_metrics 回调。"""
+def make_compute_pla_metrics():
+    """返回 PLA 的 compute_metrics 回调。"""
     def compute_pla_metrics(eval_preds):
-        metrics = compute_affinity_metrics(eval_preds.predictions, eval_preds.label_ids, thresholds=thresholds)
-        rank0_print(
-            f"  [Val] RMSE={metrics['rmse']:.4f}  MAE={metrics['mae']:.4f}  "
-            f"SD={metrics['sd']:.4f}  Pearson R={metrics['pearson_r']:.4f}  "
-            f"Accuracy={metrics['accuracy']:.4f}"
-        )
-        return {k: metrics[k] for k in ("rmse", "mae", "sd", "pearson_r", "accuracy")}
+        metrics = compute_affinity_metrics(eval_preds.predictions, eval_preds.label_ids)
+        return {k: metrics[k] for k in ("rmse", "mae", "sd", "pearson", "spearman")}
     return compute_pla_metrics
 
 
@@ -175,8 +136,8 @@ class TrainingArguments(transformers.TrainingArguments):
     optim: str = field(default="adamw_torch")
     remove_unused_columns: bool = field(default=False)
     load_best_model_at_end: bool = field(default=True)
-    metric_for_best_model: str = field(default="accuracy")
-    greater_is_better: bool = field(default=True)
+    metric_for_best_model: str = field(default="rmse")
+    greater_is_better: bool = field(default=False)
 
     # PLA specific arguments
     tune_protein_abstractor: bool = field(default=True)
@@ -214,6 +175,10 @@ class TrainingArguments(transformers.TrainingArguments):
     ligand_abstractor_lr: Optional[float] = None
     group_by_modality_length: bool = field(default=False)
     save_safetensors: bool = False
+    upload_best_checkpoint_to_wandb: bool = field(
+        default=False,
+        metadata={"help": "Whether to upload full best checkpoint directory to W&B artifact."}
+    )
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -452,12 +417,83 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
     )
 
 
+def parse_training_config():
+    parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
+    cli_args = sys.argv[1:]
+    config_path = None
+
+    if "--config" in cli_args:
+        cfg_idx = cli_args.index("--config")
+        if cfg_idx + 1 >= len(cli_args):
+            raise ValueError("`--config` requires a yaml/json file path.")
+        config_path = cli_args[cfg_idx + 1]
+        cli_args = cli_args[:cfg_idx] + cli_args[cfg_idx + 2:]
+        if cli_args:
+            raise ValueError("Do not mix extra CLI args with `--config`; put all parameters into the config file.")
+    elif len(cli_args) == 1 and cli_args[0].endswith((".yaml", ".yml", ".json")):
+        config_path = cli_args[0]
+        cli_args = []
+
+    if config_path is not None:
+        config_path = os.path.abspath(config_path)
+        if config_path.endswith(".json"):
+            model_args, data_args, training_args = parser.parse_json_file(json_file=config_path)
+        elif config_path.endswith((".yaml", ".yml")):
+            model_args, data_args, training_args = parser.parse_yaml_file(yaml_file=config_path)
+        else:
+            raise ValueError(f"Unsupported config file: {config_path}")
+        return model_args, data_args, training_args, config_path
+
+    model_args, data_args, training_args = parser.parse_args_into_dataclasses(args=cli_args)
+    return model_args, data_args, training_args, None
+
+
+def finalize_wandb_run(training_args, trainer, config_path=None):
+    """Log lightweight W&B summaries only (no artifact/weights upload)."""
+    report_to = getattr(training_args, "report_to", None)
+    if training_args.local_rank not in (-1, 0):
+        return
+    if isinstance(report_to, str):
+        use_wandb = "wandb" in report_to.lower().split(",") or report_to.lower() == "wandb"
+    elif isinstance(report_to, (list, tuple, set)):
+        use_wandb = any(str(x).lower() == "wandb" for x in report_to)
+    else:
+        use_wandb = False
+    if not use_wandb:
+        return
+
+    try:
+        import wandb
+    except Exception:
+        return
+
+    run = wandb.run
+    if run is None:
+        return
+
+    best_ckpt = trainer.state.best_model_checkpoint or ""
+    ckpt_name = pathlib.Path(best_ckpt).name
+    best_step = int(ckpt_name.split("checkpoint-", 1)[1]) if ckpt_name.startswith("checkpoint-") and ckpt_name.split("checkpoint-", 1)[1].isdigit() else None
+
+    if best_step is not None:
+        trainer.log({"best_step": best_step})
+        run.summary["best_step"] = best_step
+    if best_ckpt:
+        run.summary["best_model_checkpoint"] = str(best_ckpt)
+    if trainer.state.best_metric is not None:
+        run.summary["best_metric"] = float(trainer.state.best_metric)
+
+
 def train():
     global local_rank
 
-    parser = transformers.HfArgumentParser(
-        (ModelArguments, DataArguments, TrainingArguments))
-    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    model_args, data_args, training_args, config_path = parse_training_config()
+
+    # 固定 wandb 项目名；若走 yaml 配置，run_name 与配置文件名保持一致。
+    if config_path is not None:
+        training_args.run_name = pathlib.Path(config_path).stem
+
+    transformers.set_seed(training_args.seed)
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
 
@@ -690,18 +726,15 @@ def train():
     weight_tensor = torch.tensor(train_weights, dtype=torch.float32)
     rank0_print(f"Weight tensor (interval medians): {weight_tensor.tolist()}")
 
-    train_thresholds = data_module["train_dataset"].thresholds
-
     trainer = PLATrainer(
         model=model,
         tokenizer=tokenizer,
         args=training_args,
-        compute_metrics=make_compute_pla_metrics(train_thresholds),
+        compute_metrics=make_compute_pla_metrics(),
         preferential_ids=preferential_ids,
         weight_tensor=weight_tensor,
         **data_module,
     )
-    trainer.set_train_thresholds(train_thresholds)
 
     # if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
     #     trainer.train(resume_from_checkpoint=True)
@@ -712,6 +745,13 @@ def train():
     trainer.train()
 
     trainer.save_state()
+
+    # 统一记录“最优模型对应的验证指标”，便于在 wandb 中快速查看。
+    if trainer.state.best_metric is not None:
+        best_metric_name = training_args.metric_for_best_model
+        if not best_metric_name.startswith("eval_"):
+            best_metric_name = f"eval_{best_metric_name}"
+        trainer.log({f"best_{best_metric_name}": float(trainer.state.best_metric)})
 
     # ----------------------------------------------------------------
     # 训练结束后在测试集上评估（使用验证集最优 checkpoint 的权重）
@@ -729,24 +769,16 @@ def train():
                 "(not necessarily best) model weights."
             )
 
-        test_output = trainer.predict(test_dataset)
-        test_metrics = compute_affinity_metrics(
-            test_output.predictions, test_output.label_ids, thresholds=train_thresholds
+        test_metrics = trainer.evaluate(
+            eval_dataset=test_dataset,
+            metric_key_prefix="test",
         )
 
-        # Persist test metrics to output_dir for later comparison and reporting.
-        trainer.log_metrics("test", test_metrics)
-        trainer.save_metrics("test", test_metrics)
+        # Explicitly route test metrics through Trainer callbacks (e.g. W&B).
+        trainer.log(test_metrics)
 
-        rank0_print("\n[Test Set Results]")
-        rank0_print(f"  Samples  : {test_metrics['num_samples']}")
-        rank0_print(f"  RMSE     : {test_metrics['rmse']:.4f}")
-        rank0_print(f"  MAE      : {test_metrics['mae']:.4f}")
-        rank0_print(f"  SD       : {test_metrics['sd']:.4f}")
-        rank0_print(f"  Pearson R: {test_metrics['pearson_r']:.4f}  (p={test_metrics['pearson_p']:.2e})")
-        rank0_print(f"  Spearman : {test_metrics['spearman_r']:.4f}  (p={test_metrics['spearman_p']:.2e})")
-        rank0_print(f"  Accuracy : {test_metrics['accuracy']:.4f}")
-        rank0_print("=" * 60 + "\n")
+        # Persist test metrics to output_dir for later comparison and reporting.
+        trainer.save_metrics("test", test_metrics)
 
     model.config.use_cache = True
 
@@ -765,6 +797,8 @@ def train():
         safe_save_model_for_hf_trainer(trainer=trainer,
                                        output_dir=training_args.output_dir,
                                        )
+
+    finalize_wandb_run(training_args, trainer, config_path=config_path)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,52 @@
+model_name_or_path: /data/chenruixi/resources/modelscope/llama2-7b
+version: v1
+
+data_path: datasets/csar/random/train.csv
+val_data_path: datasets/csar/random/val.csv
+test_data_path: datasets/csar/random/test.csv
+num_affinity_levels: 5
+is_multimodal: true
+lazy_preprocess: true
+
+output_dir: ./pla-align/csar-random
+seed: 1234
+bf16: true
+tf32: true
+
+num_train_epochs: 15
+per_device_train_batch_size: 8
+per_device_eval_batch_size: 8
+gradient_accumulation_steps: 4
+dataloader_num_workers: 0
+
+evaluation_strategy: epoch
+save_strategy: epoch
+save_total_limit: 3
+load_best_model_at_end: true
+metric_for_best_model: rmse
+greater_is_better: false
+
+learning_rate: 2.0e-5
+weight_decay: 0.01
+warmup_ratio: 0.05
+lr_scheduler_type: cosine
+
+logging_steps: 10
+gradient_checkpointing: true
+model_max_length: 2048
+
+tune_protein_abstractor: true
+tune_ligand_abstractor: true
+freeze_protein_encoder: true
+freeze_ligand_encoder: true
+freeze_llm: false
+
+lora_enable: true
+lora_r: 128
+lora_alpha: 256
+lora_dropout: 0.05
+protein_abstractor_lr: 2.0e-5
+ligand_abstractor_lr: 2.0e-5
+
+report_to:
+  - wandb
